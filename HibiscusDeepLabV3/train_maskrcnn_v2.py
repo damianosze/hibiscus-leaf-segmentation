@@ -120,7 +120,7 @@ class HibiscusDataset(Dataset):
                 )
 
             mask = torch.from_numpy(
-                np.asarray(mask_image, dtype=np.uint8)
+                np.array(mask_image, dtype=np.uint8, copy=True)
             )
 
             if mask.sum().item() == 0:
@@ -224,7 +224,7 @@ def calculate_validation_iou(model, loader):
     total_fp = 0
     total_fn = 0
 
-    with torch.no_grad():
+    with torch.inference_mode():
 
         for images, targets in loader:
 

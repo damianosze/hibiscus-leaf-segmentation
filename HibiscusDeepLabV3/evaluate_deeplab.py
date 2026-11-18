@@ -1,18 +1,17 @@
-
 import json
-import random
 from pathlib import Path
 
 import numpy as np
 import torch
 
 from PIL import Image, ImageDraw
+from scipy import ndimage
 from torch.utils.data import Dataset, DataLoader, Subset
 from torchvision.transforms import functional as TF
 from torchvision.models.segmentation import deeplabv3_resnet50
+from torchmetrics.detection import MeanAveragePrecision
 
 
-SEED = 42
 NUM_CLASSES = 2
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -27,6 +26,13 @@ SPLIT_FILE = OUTPUT_DIR / "split_indices.json"
 DEVICE = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
+
+
+MIN_COMPONENT_AREA = 16
+
+
+def collate_fn(batch):
+    return tuple(zip(*batch))
 
 
 class HibiscusSemanticDataset(Dataset):
@@ -68,6 +74,8 @@ class HibiscusSemanticDataset(Dataset):
             dtype=np.uint8
         )
 
+        instance_masks = []
+
         for ann in self.annotations_by_image.get(
             info["id"], []
         ):
@@ -102,9 +110,21 @@ class HibiscusSemanticDataset(Dataset):
                     fill=1
                 )
 
-            semantic_mask[
-                np.asarray(mask_image) > 0
-            ] = 1
+            mask = np.asarray(mask_image) > 0
+
+            if not mask.any():
+                continue
+
+            semantic_mask[mask] = 1
+            instance_masks.append(mask)
+
+        if instance_masks:
+            instances = np.stack(instance_masks)
+        else:
+            instances = np.zeros(
+                (0, height, width),
+                dtype=bool
+            )
 
         image_tensor = TF.to_tensor(image)
 
@@ -119,7 +139,12 @@ class HibiscusSemanticDataset(Dataset):
             dtype=torch.long
         )
 
-        return image_tensor, mask_tensor, info["file_name"]
+        return (
+            image_tensor,
+            mask_tensor,
+            torch.from_numpy(instances),
+            info["file_name"]
+        )
 
 
 def create_model():
@@ -170,6 +195,34 @@ def calculate_metrics(tp, fp, fn):
     return iou, precision, recall, f1
 
 
+def extract_instances(foreground, probabilities):
+
+
+    labeled, count = ndimage.label(foreground)
+
+    masks = []
+    scores = []
+
+    for component_id in range(1, count + 1):
+
+        component = labeled == component_id
+
+        if component.sum() < MIN_COMPONENT_AREA:
+            continue
+
+        masks.append(component)
+        scores.append(float(probabilities[component].mean()))
+
+    height, width = foreground.shape
+
+    if masks:
+        masks = np.stack(masks)
+    else:
+        masks = np.zeros((0, height, width), dtype=bool)
+
+    return masks, np.asarray(scores, dtype=np.float32)
+
+
 def main():
 
     if not MODEL_FILE.exists():
@@ -194,7 +247,8 @@ def main():
         val_dataset,
         batch_size=1,
         shuffle=False,
-        num_workers=0
+        num_workers=0,
+        collate_fn=collate_fn
     )
 
     model = create_model()
@@ -205,12 +259,15 @@ def main():
 
     results = []
 
-    with torch.no_grad():
+    map_preds = []
+    map_targets = []
 
-        for images, masks, filenames in loader:
+    with torch.inference_mode():
 
-            images = images.to(DEVICE)
-            masks = masks.to(DEVICE)
+        for images, masks, instances, filenames in loader:
+
+            images = torch.stack(images).to(DEVICE)
+            masks = torch.stack(masks).to(DEVICE)
 
             outputs = model(images)["out"]
 
@@ -239,17 +296,63 @@ def main():
                 "f1": f1
             })
 
+            # Przybliżone instancje do Mask AP
+            probabilities = (
+                torch.softmax(outputs, dim=1)[0, 1]
+                .cpu()
+                .numpy()
+            )
+
+            foreground = pred[0].cpu().numpy()
+
+            pred_masks, pred_scores = extract_instances(
+                foreground,
+                probabilities
+            )
+
+            map_preds.append({
+                "masks": torch.from_numpy(pred_masks),
+                "scores": torch.from_numpy(pred_scores),
+                "labels": torch.ones(
+                    len(pred_scores), dtype=torch.int64
+                )
+            })
+
+            gt_instances = instances[0].cpu().numpy().astype(bool)
+
+            map_targets.append({
+                "masks": torch.from_numpy(gt_instances),
+                "labels": torch.ones(
+                    len(gt_instances), dtype=torch.int64
+                )
+            })
+
     iou, precision, recall, f1 = calculate_metrics(
         total_tp,
         total_fp,
         total_fn
     )
 
+    metric = MeanAveragePrecision(
+        iou_type="segm",
+        backend="pycocotools"
+    )
+
+    metric.update(map_preds, map_targets)
+
+    map_result = metric.compute()
+
+    instance_metrics = {
+        "mask_map": float(map_result["map"]),
+        "mask_ap50": float(map_result["map_50"]),
+        "mask_ap75": float(map_result["map_75"])
+    }
+
     print("\nEwaluacja DeepLabV3-ResNet50")
 
     print("Liczba zdjęć walidacyjnych:", len(val_dataset))
 
-    print("\nWyniki zbiorcze:")
+    print("\nWyniki zbiorcze (piksele):")
     print(f"IoU:       {iou:.4f}")
     print(f"Precision: {precision:.4f}")
     print(f"Recall:    {recall:.4f}")
@@ -259,6 +362,11 @@ def main():
     print("TP:", total_tp)
     print("FP:", total_fp)
     print("FN:", total_fn)
+
+    print("\nMiary instancyjne (przybliżenie: składowe spójne maski):")
+    print(f"Mask mAP:   {instance_metrics['mask_map']:.4f}")
+    print(f"Mask AP50:  {instance_metrics['mask_ap50']:.4f}")
+    print(f"Mask AP75:  {instance_metrics['mask_ap75']:.4f}")
 
     print("\nWyniki dla zdjęć:")
 
@@ -284,6 +392,7 @@ def main():
             "tp": total_tp,
             "fp": total_fp,
             "fn": total_fn,
+            "instance_metrics": instance_metrics,
             "images": results
         }, f, indent=2)
 

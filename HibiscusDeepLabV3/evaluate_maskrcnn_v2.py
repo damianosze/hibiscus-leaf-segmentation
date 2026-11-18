@@ -1,4 +1,3 @@
-
 import json
 import numpy as np
 import torch
@@ -8,6 +7,7 @@ from PIL import Image, ImageDraw
 
 from torch.utils.data import Dataset, DataLoader, Subset
 from torchvision.transforms import functional as TF
+from torchmetrics.detection import MeanAveragePrecision
 
 from torchvision.models.detection import (
     maskrcnn_resnet50_fpn_v2,
@@ -15,7 +15,6 @@ from torchvision.models.detection import (
 
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
-
 
 
 NUM_CLASSES = 2
@@ -39,14 +38,9 @@ MASK_THRESHOLD = 0.5
 THRESHOLDS = [0.3, 0.5, 0.7, 0.9]
 
 
-
 def collate_fn(batch):
-    """
-    Zachowuje obrazy, targety i nazwy plików
-    jako osobne listy zamiast łączyć je w słownik.
-    """
-    return tuple(zip(*batch))
 
+    return tuple(zip(*batch))
 
 
 class HibiscusDataset(Dataset):
@@ -267,6 +261,49 @@ def calculate_metrics(tp, fp, fn):
     }
 
 
+def compute_mask_map(predictions):
+
+
+    metric = MeanAveragePrecision(
+        iou_type="segm",
+        backend="pycocotools"
+    )
+
+    preds = []
+    targets = []
+
+    for sample in predictions:
+
+        n_pred = len(sample["scores"])
+        n_gt = len(sample["gt_instances"])
+
+        preds.append({
+            "masks": torch.from_numpy(
+                sample["masks"] >= MASK_THRESHOLD
+            ),
+            "scores": torch.from_numpy(
+                sample["scores"]
+            ).float(),
+            "labels": torch.ones(n_pred, dtype=torch.int64)
+        })
+
+        targets.append({
+            "masks": torch.from_numpy(
+                sample["gt_instances"]
+            ),
+            "labels": torch.ones(n_gt, dtype=torch.int64)
+        })
+
+    metric.update(preds, targets)
+
+    result = metric.compute()
+
+    return {
+        "mask_map": float(result["map"]),
+        "mask_ap50": float(result["map_50"]),
+        "mask_ap75": float(result["map_75"])
+    }
+
 
 def main():
 
@@ -310,7 +347,7 @@ def main():
 
     print("\nRozpoczynam ewaluację modelu...")
 
-    with torch.no_grad():
+    with torch.inference_mode():
 
         for images, targets, filenames in loader:
 
@@ -325,12 +362,12 @@ def main():
                 outputs, targets, filenames
             ):
 
-                gt_masks = (
+                gt_instances = (
                     target["masks"].cpu().numpy().astype(bool)
                 )
 
-                if len(gt_masks):
-                    gt = np.any(gt_masks, axis=0)
+                if len(gt_instances):
+                    gt = np.any(gt_instances, axis=0)
                 else:
                     gt = np.zeros(
                         target["masks"].shape[-2:],
@@ -340,6 +377,7 @@ def main():
                 predictions.append({
                     "file_name": filename,
                     "gt": gt,
+                    "gt_instances": gt_instances,
                     "masks": (
                         output["masks"]
                         .cpu()
@@ -351,7 +389,6 @@ def main():
                         .numpy()
                     )
                 })
-
 
     def evaluate(threshold):
 
@@ -380,13 +417,14 @@ def main():
 
     metrics, detections = evaluate(SCORE_THRESHOLD)
 
+    map_results = compute_mask_map(predictions)
 
     print("\nEwaluacja Mask R-CNN ResNet50 FPN V2")
 
     print("Liczba zdjęć walidacyjnych:", len(val_dataset))
     print("Próg pewności:", SCORE_THRESHOLD)
 
-    print("\nWyniki zbiorcze:")
+    print("\nWyniki zbiorcze (piksele):")
 
     print(f"IoU:       {metrics['iou']:.4f}")
     print(f"Precision: {metrics['precision']:.4f}")
@@ -401,6 +439,10 @@ def main():
 
     print("\nLiczba detekcji:", detections)
 
+    print("\nMiary instancyjne (COCO, wszystkie detekcje):")
+    print(f"Mask mAP:   {map_results['mask_map']:.4f}")
+    print(f"Mask AP50:  {map_results['mask_ap50']:.4f}")
+    print(f"Mask AP75:  {map_results['mask_ap75']:.4f}")
 
     print("\nWyniki dla zdjęć:")
 
@@ -426,7 +468,6 @@ def main():
             f"IoU: {m['iou']:.4f} "
             f"F1: {m['f1']:.4f}"
         )
-
 
     print("\nWpływ progu pewności:")
 
@@ -459,7 +500,6 @@ def main():
             f"{m['f1']:>10.4f}"
         )
 
-
     OUTPUT_DIR.mkdir(
         parents=True,
         exist_ok=True
@@ -474,6 +514,7 @@ def main():
         json.dump({
             "main_results": metrics,
             "detections": detections,
+            "instance_metrics": map_results,
             "threshold_results": threshold_results
         }, f, indent=2)
 

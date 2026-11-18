@@ -1,4 +1,3 @@
-
 import json
 import random
 import time
@@ -16,7 +15,6 @@ from torchvision.models.segmentation import (
     deeplabv3_resnet50,
     DeepLabV3_ResNet50_Weights,
 )
-
 
 
 SEED = 42
@@ -75,7 +73,6 @@ class HibiscusSemanticDataset(Dataset):
         image = Image.open(image_path).convert("RGB")
 
         width, height = image.size
-
 
         semantic_mask = np.zeros(
             (height, width),
@@ -136,7 +133,6 @@ class HibiscusSemanticDataset(Dataset):
         return image_tensor, mask_tensor
 
 
-
 def create_model():
 
     model = deeplabv3_resnet50(
@@ -164,7 +160,6 @@ def create_model():
     return model
 
 
-
 def calculate_iou(model, loader):
 
     model.eval()
@@ -173,7 +168,7 @@ def calculate_iou(model, loader):
     total_fp = 0
     total_fn = 0
 
-    with torch.no_grad():
+    with torch.inference_mode():
 
         for images, masks in loader:
 
@@ -199,7 +194,6 @@ def calculate_iou(model, loader):
     )
 
 
-
 def main():
 
     dataset = HibiscusSemanticDataset(
@@ -222,7 +216,6 @@ def main():
 
     val_indices = indices[:val_count]
     train_indices = indices[val_count:]
-
 
     with open(
         OUTPUT_DIR / "split_indices.json",
